@@ -1,143 +1,265 @@
 // src/index.ts
-import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
-import { config } from './config/config';
-import { CommandHandler } from './handlers/commandHandler';
+import { Client, GatewayIntentBits, Partials, ActivityType } from 'discord.js';
+import { config, validateConfig } from './config/config';
+import { Logger } from './utils/logger';
+import { DatabaseManager } from './services/database/databaseManager';
 import { MemoryManager } from './services/memory/memoryManager';
 import { APIOrchestrator } from './services/ai/apiOrchestrator';
-import { DatabaseManager } from './services/database/databaseManager';
+import { CommandHandler } from './handlers/commandHandler';
+import { MessageHandler } from './handlers/messageHandler';
 import { AnalyticsService } from './services/analytics/analyticsService';
-import { Logger } from './utils/logger';
-import { registerCommands } from './commands/register';
+import { HealthMonitor } from './utils/healthMonitor';
+import { registerCommands } from './utils/registerCommands';
 
-class DiscordBot {
-    private client: Client;
-    private commandHandler: CommandHandler;
-    private memoryManager: MemoryManager;
-    private apiOrchestrator: APIOrchestrator;
-    private databaseManager: DatabaseManager;
-    private analyticsService: AnalyticsService;
-    private logger: Logger;
+// Initialize services
+const logger = new Logger('Main');
+let client: Client;
+let isShuttingDown = false;
 
-    constructor() {
-        this.logger = new Logger('DiscordBot');
-        this.client = new Client({
+// Error handlers
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception:', error);
+    gracefulShutdown(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Graceful shutdown
+async function gracefulShutdown(code: number = 0) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    
+    logger.info('Initiating graceful shutdown...');
+    
+    try {
+        if (client) {
+            client.destroy();
+        }
+        
+        // Close database connections
+        await DatabaseManager.getInstance().close();
+        
+        // Save memory state
+        await MemoryManager.getInstance().saveState();
+        
+        logger.info('Shutdown complete');
+        process.exit(code);
+    } catch (error) {
+        logger.error('Error during shutdown:', error);
+        process.exit(1);
+    }
+}
+
+// Signal handlers
+process.on('SIGINT', () => gracefulShutdown(0));
+process.on('SIGTERM', () => gracefulShutdown(0));
+
+// Main bot initialization
+async function initializeBot() {
+    try {
+        // Validate configuration
+        validateConfig();
+        logger.info('Configuration validated');
+        
+        // Initialize database
+        await DatabaseManager.getInstance().initialize();
+        logger.info('Database initialized');
+        
+        // Initialize memory manager
+        await MemoryManager.getInstance().initialize();
+        logger.info('Memory manager initialized');
+        
+        // Initialize API orchestrator
+        await APIOrchestrator.getInstance().initialize();
+        logger.info('API orchestrator initialized');
+        
+        // Initialize analytics
+        if (config.features.analytics.enabled) {
+            await AnalyticsService.getInstance().initialize();
+            logger.info('Analytics service initialized');
+        }
+        
+        // Create Discord client
+        client = new Client({
             intents: [
                 GatewayIntentBits.Guilds,
                 GatewayIntentBits.GuildMessages,
                 GatewayIntentBits.MessageContent,
+                GatewayIntentBits.DirectMessages,
                 GatewayIntentBits.GuildMembers,
                 GatewayIntentBits.GuildVoiceStates,
-                GatewayIntentBits.DirectMessages
-            ]
+                GatewayIntentBits.GuildMessageReactions
+            ],
+            partials: [
+                Partials.Channel,
+                Partials.Message,
+                Partials.User,
+                Partials.GuildMember,
+                Partials.Reaction
+            ],
+            allowedMentions: {
+                parse: ['users', 'roles'],
+                repliedUser: true
+            }
         });
-
-        this.databaseManager = new DatabaseManager();
-        this.memoryManager = new MemoryManager(this.databaseManager);
-        this.apiOrchestrator = new APIOrchestrator();
-        this.analyticsService = new AnalyticsService(this.databaseManager);
-        this.commandHandler = new CommandHandler(
-            this.memoryManager,
-            this.apiOrchestrator,
-            this.analyticsService
-        );
-    }
-
-    async start() {
-        try {
-            // Initialize services
-            await this.databaseManager.connect();
-            await this.memoryManager.initialize();
-            await this.apiOrchestrator.initialize();
+        
+        // Initialize handlers
+        const commandHandler = new CommandHandler(client);
+        const messageHandler = new MessageHandler(client);
+        
+        // Set up event handlers
+        client.once('ready', async () => {
+            if (!client.user) return;
+            
+            logger.info(`Bot logged in as ${client.user.tag}`);
+            
+            // Set bot activity
+            client.user.setActivity('with AI models', { 
+                type: ActivityType.Playing 
+            });
             
             // Register slash commands
-            await this.registerSlashCommands();
+            await registerCommands(client);
+            logger.info('Slash commands registered');
             
-            // Set up event handlers
-            this.setupEventHandlers();
+            // Initialize handlers
+            await commandHandler.initialize();
+            await messageHandler.initialize();
             
-            // Login to Discord
-            await this.client.login(config.discord.token);
-            this.logger.info('Bot successfully started!');
-        } catch (error) {
-            this.logger.error('Failed to start bot:', error);
-            process.exit(1);
-        }
-    }
-
-    private async registerSlashCommands() {
-        const rest = new REST({ version: '10' }).setToken(config.discord.token);
+            // Start health monitoring
+            const healthMonitor = new HealthMonitor(client);
+            healthMonitor.start();
+            
+            logger.info('Bot is fully operational');
+            
+            // Log startup stats
+            const stats = await APIOrchestrator.getInstance().getProviderStats();
+            logger.info('Available AI providers:', stats.filter(s => s.available).map(s => s.name));
+        });
         
-        try {
-            const commands = registerCommands();
-            await rest.put(
-                Routes.applicationCommands(config.discord.clientId),
-                { body: commands }
-            );
-            this.logger.info('Successfully registered slash commands');
-        } catch (error) {
-            this.logger.error('Failed to register slash commands:', error);
-        }
-    }
-
-    private setupEventHandlers() {
-        this.client.on('ready', () => {
-            this.logger.info(`Logged in as ${this.client.user?.tag}!`);
-            this.analyticsService.trackEvent('bot_ready', {
-                guilds: this.client.guilds.cache.size
+        // Error handling
+        client.on('error', (error) => {
+            logger.error('Discord client error:', error);
+        });
+        
+        client.on('warn', (warning) => {
+            logger.warn('Discord client warning:', warning);
+        });
+        
+        // Shard events (if sharding)
+        client.on('shardError', (error, shardId) => {
+            logger.error(`Shard ${shardId} error:`, error);
+        });
+        
+        client.on('shardReconnecting', (shardId) => {
+            logger.info(`Shard ${shardId} reconnecting...`);
+        });
+        
+        client.on('shardReady', (shardId) => {
+            logger.info(`Shard ${shardId} ready`);
+        });
+        
+        client.on('shardDisconnect', (event, shardId) => {
+            logger.warn(`Shard ${shardId} disconnected:`, event);
+        });
+        
+        // Rate limit handling
+        client.on('rateLimit', (rateLimitData) => {
+            logger.warn('Rate limit hit:', {
+                timeout: rateLimitData.timeout,
+                limit: rateLimitData.limit,
+                method: rateLimitData.method,
+                path: rateLimitData.path,
+                route: rateLimitData.route
             });
         });
-
-        this.client.on('interactionCreate', async (interaction) => {
-            if (!interaction.isChatInputCommand()) return;
+        
+        // Guild events
+        client.on('guildCreate', async (guild) => {
+            logger.info(`Joined new guild: ${guild.name} (${guild.id})`);
             
-            try {
-                await this.commandHandler.handleCommand(interaction);
-                this.analyticsService.trackEvent('command_executed', {
-                    command: interaction.commandName,
-                    user: interaction.user.id,
-                    guild: interaction.guildId
+            // Send welcome message
+            const defaultChannel = guild.systemChannel || 
+                guild.channels.cache.find(ch => ch.isTextBased() && ch.permissionsFor(guild.members.me!)?.has('SendMessages'));
+            
+            if (defaultChannel && defaultChannel.isTextBased()) {
+                await defaultChannel.send({
+                    embeds: [{
+                        title: '👋 Hello! I\'m your AI-powered Discord bot',
+                        description: 'I\'m equipped with multiple AI models and advanced memory systems to provide the best experience.',
+                        fields: [
+                            {
+                                name: '🚀 Getting Started',
+                                value: 'Use `/help` to see all available commands'
+                            },
+                            {
+                                name: '🧠 AI Models',
+                                value: 'I can use OpenRouter (DeepSeek), Google AI, HuggingFace, and more!'
+                            },
+                            {
+                                name: '💾 Memory System',
+                                value: 'I remember conversations and learn from interactions'
+                            },
+                            {
+                                name: '🛡️ Privacy',
+                                value: 'Use `/optin` and `/optout` to control data features'
+                            }
+                        ],
+                        color: 0x7289DA,
+                        footer: {
+                            text: 'Powered by OpenRouter & Multiple AI Providers'
+                        }
+                    }]
                 });
-            } catch (error) {
-                this.logger.error('Command execution failed:', error);
-                await interaction.reply({
-                    content: 'An error occurred while executing this command.',
-                    ephemeral: true
+            }
+            
+            // Track analytics
+            if (config.features.analytics.enabled) {
+                await AnalyticsService.getInstance().trackEvent('guild_join', {
+                    guildId: guild.id,
+                    guildName: guild.name,
+                    memberCount: guild.memberCount
                 });
             }
         });
-
-        this.client.on('messageCreate', async (message) => {
-            if (message.author.bot) return;
+        
+        client.on('guildDelete', async (guild) => {
+            logger.info(`Left guild: ${guild.name} (${guild.id})`);
             
-            // Handle contextual memory updates
-            await this.memoryManager.updateContextualMemory(
-                message.channelId,
-                {
-                    content: message.content,
-                    userId: message.author.id,
-                    timestamp: new Date()
-                }
-            );
+            // Clean up guild data
+            await DatabaseManager.getInstance().cleanupGuildData(guild.id);
             
-            // Track message for analytics
-            this.analyticsService.trackEvent('message_received', {
-                channel: message.channelId,
-                user: message.author.id
-            });
+            // Track analytics
+            if (config.features.analytics.enabled) {
+                await AnalyticsService.getInstance().trackEvent('guild_leave', {
+                    guildId: guild.id,
+                    guildName: guild.name
+                });
+            }
         });
-
-        this.client.on('error', (error) => {
-            this.logger.error('Discord client error:', error);
-        });
+        
+        // Connect to Discord
+        logger.info('Connecting to Discord...');
+        await client.login(config.discord.token);
+        
+    } catch (error) {
+        logger.error('Failed to initialize bot:', error);
+        await gracefulShutdown(1);
     }
 }
 
-// Start the bot
-const bot = new DiscordBot();
-bot.start().catch(console.error);
+// Singleton getter for other modules
+export function getClient(): Client {
+    if (!client) {
+        throw new Error('Discord client not initialized');
+    }
+    return client;
+}
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('Shutting down gracefully...');
-    process.exit(0);
+// Start the bot
+initializeBot().catch((error) => {
+    logger.error('Fatal error during startup:', error);
+    process.exit(1);
 });

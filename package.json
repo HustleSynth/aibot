@@ -1,0 +1,45 @@
+{
+  "name": "discord-ai-bot",
+  "version": "1.0.0",
+  "description": "Industry-leading Discord bot with AI orchestration and quad-tier memory",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:prod": "pm2 start dist/index.js --name discord-bot",
+    "lint": "eslint src/**/*.ts",
+    "test": "jest",
+    "docker:build": "docker build -t discord-bot .",
+    "docker:run": "docker run -d --env-file .env discord-bot"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "ai",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.3",
+    "axios": "^1.6.5",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "mongodb": "^6.3.0",
+    "pm2": "^5.3.0",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "eslint": "^8.56.0",
+    "jest": "^29.7.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
